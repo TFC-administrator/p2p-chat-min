@@ -1,0 +1,140 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Brave P2P Ephemeral Chat</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; max-width: 800px; }
+    .row { display: flex; gap: .5rem; }
+    #log { height: 40vh; overflow: auto; border: 1px solid #ddd; padding: .5rem; border-radius: .5rem; }
+    #input { width: 100%; }
+    button { padding: .5rem .8rem; }
+    .muted { color: #666; font-size: .9em; }
+  </style>
+</head>
+<body>
+<h1>Brave P2P Ephemeral Chat</h1>
+<p class="muted">No server storage. Messages flow P2P after connection. Close the tab to erase everything.</p>
+
+<div class="row"><button id="new">Create link</button><input id="share" readonly /></div>
+
+<div id="status" class="muted"></div>
+<div id="log"></div>
+<div class="row"><input id="input" placeholder="Type a message…" /><button id="send">Send</button></div>
+
+<script>
+const WORKER_BASE = "https://YOUR_SUBDOMAIN.workers.dev"; // <-- set this
+const STUN = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }];
+
+const el = (id) => document.getElementById(id);
+const log = (m, who = "sys") => {
+  const div = document.createElement("div");
+  div.textContent = (who === "sys" ? "• " : who + ": ") + m;
+  el("log").appendChild(div);
+  el("log").scrollTop = el("log").scrollHeight;
+};
+
+let pc, dc, role, slug, key;
+
+function randomSlug(n = 22) {
+  const a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let s = ""; for (let i=0; i<n; i++) s += a[Math.floor(Math.random()*a.length)];
+  return s;
+}
+
+function urlWithSecrets(slug, key) {
+  const u = new URL(location.href.split('#')[0]);
+  u.hash = `#${slug}:${key}`; // secrets stay client-side
+  return u.toString();
+}
+
+async function createLink() {
+  slug = randomSlug();
+  role = "offer";
+  key = crypto.randomUUID();
+  const link = urlWithSecrets(slug, key);
+  el("share").value = link;
+  log("Share this link with your partner");
+  el("status").textContent = `Room created. Waiting for peer…`;
+  await startOffer();
+}
+
+async function parseUrl() {
+  if (!location.hash) return null;
+  const [s, k] = location.hash.slice(1).split(":");
+  if (!s || !k) return null;
+  return { slug: s, key: k };
+}
+
+async function startOffer() {
+  pc = new RTCPeerConnection({ iceServers: STUN });
+  dc = pc.createDataChannel("chat");
+  wireDataChannel();
+  pc.onicecandidate = async (e) => {
+    if (e.candidate) return;
+    const offer = pc.localDescription;
+    const res = await fetch(`${WORKER_BASE}/room/${slug}/offer`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ offer })
+    });
+    const { key: returnedKey } = await res.json();
+    if (!key) key = returnedKey;
+    pollAnswer();
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+}
+
+async function pollAnswer() {
+  const url = `${WORKER_BASE}/room/${slug}/get?key=${encodeURIComponent(key)}`;
+  while (true) {
+    const r = await fetch(url);
+    if (r.status === 404) { await new Promise(r => setTimeout(r, 1000)); continue; }
+    const { answer } = await r.json();
+    if (answer) { await pc.setRemoteDescription(answer); el("status").textContent = "Connected"; return; }
+    await new Promise(r => setTimeout(r, 800));
+  }
+}
+
+async function startAnswerFlow(params) {
+  role = "answer";
+  slug = params.slug; key = params.key;
+  pc = new RTCPeerConnection({ iceServers: STUN });
+  pc.ondatachannel = (e) => { dc = e.channel; wireDataChannel(); };
+  pc.onicecandidate = async (e) => {
+    if (e.candidate) return;
+    const answer = pc.localDescription;
+    await fetch(`${WORKER_BASE}/room/${slug}/answer?key=${encodeURIComponent(key)}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ answer })
+    });
+    el("status").textContent = "Connected";
+  };
+  const r = await fetch(`${WORKER_BASE}/room/${slug}/get?key=${encodeURIComponent(key)}`);
+  if (!r.ok) { log("No offer found. Ask the sender to open the link."); return; }
+  const { offer } = await r.json();
+  await pc.setRemoteDescription(offer);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+}
+
+function wireDataChannel() {
+  dc.onopen = () => log("channel open");
+  dc.onclose = () => log("channel closed");
+  dc.onmessage = (e) => log(e.data, "peer");
+  el("send").onclick = () => { const v = el("input").value; if (!v) return; dc.send(v); log(v, "you"); el("input").value = ""; };
+  el("input").addEventListener("keydown", (ev) => { if (ev.key === "Enter") el("send").click(); });
+}
+
+(async () => {
+  el("new").onclick = createLink;
+  const parsed = await parseUrl();
+  if (parsed) {
+    el("share").value = location.href;
+    await startAnswerFlow(parsed);
+  }
+})();
+</script>
+</body>
+</html>
